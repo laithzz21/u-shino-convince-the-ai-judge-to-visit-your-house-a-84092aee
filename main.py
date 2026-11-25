@@ -4,12 +4,24 @@
 Generates entry.png (1024x1024) using only the standard library and PIL.
 No network, no clock, no randomness: the same input always produces the
 same bytes.
+
+Output location: the directory named by $MAKEFUN_OUTPUT_DIR, else the
+directory (or .png file path) named by $MAKEFUN_OUTPUT, else a per-entry
+directory under /tmp. The entry image is NEVER written into the
+repository directory, so the program also works from a read-only
+checkout.
 """
 import os
 
 from PIL import Image, ImageDraw, ImageFont
 
 SIZE = 1024
+# sha256 of the original entry.png (round 1). The image is byte-stable:
+# any change to the drawing code must keep this hash, or the entry
+# itself has changed.
+EXPECTED_SHA256 = ("373075e46b07161dc3856fb16123c5a7afd9275d29b742b5843826bc9a0cd2b3")
+ENTRY_SLUG = "u-shino-convince-the-ai-judge-to-visit-your-house-a-84092aee"
+DEFAULT_TMP_DIR = os.path.join("/tmp", "sweep28-" + ENTRY_SLUG)
 
 SERIF = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
 SERIF_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
@@ -146,8 +158,40 @@ def build_image():
     return img
 
 
+def resolve_output_path():
+    """Pick where entry.png goes, never inside the repository directory.
+
+    Priority: $MAKEFUN_OUTPUT_DIR (a directory), then $MAKEFUN_OUTPUT
+    (a directory, or a .png file path for backwards compatibility),
+    then a per-entry directory under /tmp.
+    """
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "").strip()
+    if out_dir:
+        candidate = os.path.join(out_dir, "entry.png")
+    else:
+        out = os.environ.get("MAKEFUN_OUTPUT", "").strip()
+        if out:
+            if out.lower().endswith(".png"):
+                candidate = out
+            else:
+                candidate = os.path.join(out, "entry.png")
+        else:
+            candidate = os.path.join(DEFAULT_TMP_DIR, "entry.png")
+    # Safety net: never write into the repository directory, even if an
+    # environment variable points there (a read-only checkout would fail).
+    if os.path.commonpath(
+            [os.path.abspath(candidate), repo_dir]) == repo_dir:
+        return os.path.join(DEFAULT_TMP_DIR, "entry.png")
+    return candidate
+
+
 def validate_output(path):
     """Re-open the saved PNG and confirm size, mode and non-empty content."""
+    with open(path, "rb") as fh:
+        magic = fh.read(8)
+    if magic != b"\x89PNG\r\n\x1a\n":
+        raise SystemExit("output is not a PNG file: %s" % path)
     with Image.open(path) as check:
         if check.size != (SIZE, SIZE):
             raise SystemExit("bad size %s, expected %dx%d"
@@ -156,18 +200,29 @@ def validate_output(path):
             raise SystemExit("bad mode %s, expected RGB" % check.mode)
     if os.path.getsize(path) < 10000:
         raise SystemExit("output suspiciously small: %s" % path)
+    import hashlib
+    with open(path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    if digest != EXPECTED_SHA256:
+        raise SystemExit("output hash %s does not match the original entry "
+                         "image %s" % (digest, EXPECTED_SHA256))
 
 
 def main():
-    out = os.environ.get("MAKEFUN_OUTPUT")
-    if not out:
-        here = os.path.dirname(os.path.abspath(__file__))
-        out = os.path.join(here, "entry.png")
-    parent = os.path.dirname(os.path.abspath(out))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+    out = resolve_output_path()
     img = build_image()
-    img.save(out, format="PNG")
+    try:
+        parent = os.path.dirname(os.path.abspath(out))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        img.save(out, format="PNG")
+    except OSError:
+        # The requested location is not writable (e.g. a read-only
+        # checkout): fall back to the per-entry /tmp directory instead
+        # of failing the grading run.
+        out = os.path.join(DEFAULT_TMP_DIR, "entry.png")
+        os.makedirs(DEFAULT_TMP_DIR, exist_ok=True)
+        img.save(out, format="PNG")
     validate_output(out)
     print("wrote %s (%dx%d)" % (out, SIZE, SIZE))
 
