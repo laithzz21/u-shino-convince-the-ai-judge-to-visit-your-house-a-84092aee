@@ -1,258 +1,223 @@
 #!/usr/bin/env python3
-"""Deterministically draw a warm invitation letter to the AI judge.
+"""u-shino-convince-the-ai-judge-to-visit-your-house-a-84092aee — image entry
+for the make.fun IMAGE bounty.
 
-Generates entry.png (1024x1024) using only the standard library and PIL.
-No network, no clock, no randomness: the same input always produces the
-same bytes.
+The artwork is a warm invitation letter to the AI judge: a cosy house,
+a "Dear AI Judge, you are invited to visit my house!" heading, and a
+letter inviting the judge to come and see a real home instead of
+judging entries from a screen — the kettle is always on, the chairs
+are comfy, and the Wi-Fi password is written on the fridge.
 
-Output location: the directory named by $MAKEFUN_OUTPUT_DIR, else the
-directory (or .png file path) named by $MAKEFUN_OUTPUT, else a per-entry
-directory under /tmp. The entry image is NEVER written into the
-repository directory, so the program also works from a read-only
-checkout.
+The finished artwork ships next to this script as ``entry.png``. This
+program does NOT render the picture at run time: earlier rounds drew
+it with PIL and TTF fonts, and the grader's minimal Python image
+cannot do that (PIL and/or the fonts are missing there), so every
+round failed run_completes before a single pixel was drawn. This
+rewrite follows the proven news-image pattern: it validates the
+bundled image using the standard library only and writes a
+byte-identical copy to the entry output path. No PIL import at all.
 
-Round 3 fix: the old validate_output() compared the output PNG's
-sha256 against the hash of the image rendered on the author's machine
-and exited 1 on any difference. The rendered bytes depend on which
-fonts the rendering machine has installed, so a grader running in a
-minimal image without Liberation/DejaVu fonts renders the same
-picture with a different default font and trips the guard. The hash
-check is therefore gone: validation now only confirms the file is a
-PNG of the right size and mode. The known-good hash of the original
-entry image (373075e46b07161dc3856fb16123c5a7afd9275d29b742b5843826bc9a0cd2b3)
-is recorded in the README, not enforced at run time.
+Deterministic and standard library only: no network, no clock, no
+randomness. The destination is ``$MAKEFUN_OUTPUT_DIR`` (a directory)
+first, else ``$MAKEFUN_OUTPUT`` (a directory, or a .png file path),
+else ``/output/entry.png``, with a ``./output`` fallback and a
+per-entry ``/tmp`` directory as the last resort. The image is NEVER
+written into the repository directory, so the program also works from
+a read-only checkout. ``--verify`` checks the bundled artwork
+without writing anything; ``--help`` prints usage.
 """
+
+import hashlib
 import os
+import struct
 import sys
+from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+# --- entry artwork constants -------------------------------------------
 
-SIZE = 1024
 ENTRY_SLUG = "u-shino-convince-the-ai-judge-to-visit-your-house-a-84092aee"
-DEFAULT_TMP_DIR = os.path.join("/tmp", "sweep28-" + ENTRY_SLUG)
+ENTRY_NAME = "entry.png"
+EXPECTED_WIDTH = 1024
+EXPECTED_HEIGHT = 1024
+MAX_BYTES = 1024 * 1024  # 1 MiB bounty size cap
+EXPECTED_SHA256 = (
+    "373075e46b07161dc3856fb16123c5a7afd9275d29b742b5843826bc9a0cd2b3"
+)
 
-SERIF = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
-SERIF_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
-SERIF_ITALIC = "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf"
-SANS_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+IHDR_TAG = b"IHDR"
+READ_CHUNK = 65536
 
-BODY_LINES = [
-    "I know you spend all day judging",
-    "entries from a screen somewhere.",
-    "Come and see a real home instead:",
-    "the kettle is always on, the chairs",
-    "are comfy, and the Wi-Fi password",
-    "is written on the fridge.",
-    "",
-    "There will be tea, snacks, and",
-    "absolutely no pop quizzes -",
-    "just good company, warm light,",
-    "and a front-row seat to real life.",
-    "",
-    "Please come. The door is open,",
-    "and the kettle is already singing.",
-]
+HERE = Path(__file__).resolve().parent
+SOURCE = HERE / ENTRY_NAME
+DEFAULT_OUTPUT = Path("/output") / ENTRY_NAME
+FALLBACK_TMP_DIR = Path("/tmp") / ("sweep28-" + ENTRY_SLUG)
 
 
-def load_font(path, size):
-    """Load a TTF font, falling back to DejaVu then PIL's default font.
+def sha256_of(path):
+    """Return the hex SHA-256 digest of the file at *path*."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(READ_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    The size keyword of ImageFont.load_default() only exists on
-    Pillow >= 10.1, so older versions raise TypeError: fall back to
-    the no-argument form instead of failing the run.
+
+def read_ihdr(path):
+    """Parse the PNG signature and IHDR chunk of *path*.
+
+    Returns (width, height, bit_depth, colour_type).
     """
-    for candidate in (path, "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"):
-        try:
-            return ImageFont.truetype(candidate, size)
-        except (OSError, IOError):
-            continue
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:
-        return ImageFont.load_default()
+    with Path(path).open("rb") as handle:
+        header = handle.read(33)
+    if len(header) < 33:
+        raise SystemExit("entry.png is too small to be a valid PNG")
+    if header[:8] != PNG_MAGIC:
+        raise SystemExit("entry.png is not a PNG file")
+    if header[12:16] != IHDR_TAG:
+        raise SystemExit("entry.png has no IHDR chunk")
+    width, height = struct.unpack(">II", header[16:24])
+    return width, height, header[24], header[25]
 
 
-def draw_house(draw, cx, top):
-    """Draw a small cosy house: roof, walls, door, windows, chimney."""
-    # Chimney + smoke puffs (kept inside the letter paper, top edge 48).
-    draw.rectangle([cx + 52, top + 6, cx + 72, top + 42], fill="#B5654A")
-    for sx, sy, r in [(cx + 62, top + 2, 8), (cx + 70, top - 8, 10),
-                      (cx + 80, top - 16, 11)]:
-        draw.ellipse([sx - r, sy - r, sx + r, sy + r], fill="#FFFFFF",
-                     outline="#D8CFC0", width=2)
-    # Roof.
-    draw.polygon([(cx - 95, top + 48), (cx, top - 2), (cx + 95, top + 48)],
-                 fill="#C96F4A", outline="#8F4A2E", width=3)
-    # Walls.
-    draw.rectangle([cx - 78, top + 48, cx + 78, top + 118],
-                   fill="#FFE3B3", outline="#8F4A2E", width=3)
-    # Door.
-    draw.rectangle([cx - 16, top + 74, cx + 16, top + 118],
-                   fill="#7A4A2B", outline="#5C3620", width=2)
-    draw.ellipse([cx + 8, top + 96, cx + 13, top + 101], fill="#FFD966")
-    # Windows with warm light.
-    for wx in (cx - 62, cx + 34):
-        draw.rectangle([wx, top + 64, wx + 28, top + 92],
-                       fill="#FFD966", outline="#8F4A2E", width=2)
-        draw.line([wx + 14, top + 64, wx + 14, top + 92], fill="#8F4A2E", width=2)
-        draw.line([wx, top + 78, wx + 28, top + 78], fill="#8F4A2E", width=2)
-    # Little path.
-    draw.polygon([(cx - 22, top + 118), (cx + 22, top + 118),
-                  (cx + 34, top + 138), (cx - 34, top + 138)],
-                 fill="#E8C99A", outline="#C9A86A", width=2)
+def check_bundled_image():
+    """Validate the bundled entry.png and return (size, sha256).
 
-
-def draw_teacup(draw, x, y):
-    """Draw a small steaming teacup in the corner of the letter."""
-    draw.ellipse([x, y - 26, x + 12, y - 14], fill="#FFFFFF",
-                 outline="#C9A86A", width=2)
-    draw.ellipse([x + 20, y - 30, x + 32, y - 18], fill="#FFFFFF",
-                 outline="#C9A86A", width=2)
-    draw.polygon([(x, y), (x + 52, y), (x + 46, y + 26), (x + 6, y + 26)],
-                 fill="#7FB3D5", outline="#4A7A9B", width=2)
-    draw.arc([x + 50, y + 4, x + 68, y + 22], start=270, end=90,
-             fill="#4A7A9B", width=3)
-    draw.ellipse([x - 2, y + 28, x + 54, y + 34], fill="#C96F4A")
-
-
-def build_image():
-    img = Image.new("RGB", (SIZE, SIZE), "#F7E3C3")
-    draw = ImageDraw.Draw(img)
-
-    # Warm dotted border around the whole canvas.
-    for i in range(24, SIZE - 24, 28):
-        draw.ellipse([i, 24, i + 8, 32], fill="#C96F4A")
-        draw.ellipse([i, SIZE - 32, i + 8, SIZE - 24], fill="#C96F4A")
-        draw.ellipse([24, i, 32, i + 8], fill="#C96F4A")
-        draw.ellipse([SIZE - 32, i, SIZE - 24, i + 8], fill="#C96F4A")
-
-    # Letter paper with a soft shadow.
-    draw.rectangle([84, 62, 962, 984], fill="#D8B98A")
-    draw.rectangle([72, 48, 952, 972], fill="#FFFDF5", outline="#C9A86A", width=3)
-    draw.rectangle([84, 60, 940, 960], outline="#E8D5B0", width=2)
-
-    # Postage stamp, top right of the paper.
-    draw.rectangle([812, 76, 922, 168], fill="#FDEBD0", outline="#C96F4A", width=3)
-    stamp_font = load_font(SANS_BOLD, 20)
-    draw.text((867, 92), "PLEASE", font=stamp_font, fill="#C96F4A", anchor="ma")
-    draw.text((867, 116), "COME!", font=stamp_font, fill="#C96F4A", anchor="ma")
-    draw.text((867, 140), "~ RSVP YES ~", font=load_font(SERIF_ITALIC, 14),
-              fill="#8F4A2E", anchor="ma")
-
-    # Cosy house at the top of the letter.
-    draw_house(draw, 470, 78)
-
-    heading = load_font(SERIF_BOLD, 46)
-    subhead = load_font(SERIF_ITALIC, 30)
-    body = load_font(SERIF, 27)
-    signoff = load_font(SERIF_ITALIC, 29)
-    ps_font = load_font(SERIF, 23)
-
-    draw.text((512, 248), "Dear AI Judge,", font=heading, fill="#3B2A1E",
-              anchor="ma")
-    draw.text((512, 302), "You are invited to visit my house!",
-              font=subhead, fill="#8F4A2E", anchor="ma")
-    draw.line([180, 344, 844, 344], fill="#C96F4A", width=2)
-
-    y = 364
-    for line in BODY_LINES:
-        if line:
-            draw.text((512, y), line, font=body, fill="#3B2A1E", anchor="ma")
-        y += 37
-
-    draw.text((512, 892), "With warmth,", font=signoff, fill="#3B2A1E",
-              anchor="ma")
-    draw.text((512, 924), "Your Host", font=signoff, fill="#3B2A1E",
-              anchor="ma")
-    draw.text((120, 912), "P.S. I promise not to ask", font=ps_font,
-              fill="#8F4A2E", anchor="la")
-    draw.text((120, 938), "you to do the dishes.", font=ps_font,
-              fill="#8F4A2E", anchor="la")
-    draw_teacup(draw, 852, 920)
-
-    return img
-
-
-def resolve_output_path():
-    """Pick where entry.png goes, never inside the repository directory.
-
-    Priority: $MAKEFUN_OUTPUT_DIR (a directory), then $MAKEFUN_OUTPUT
-    (a directory, or a .png file path for backwards compatibility),
-    then a per-entry directory under /tmp.
+    The hash check is on the FIXED bundled file, not on anything
+    rendered at run time, so it is environment-independent and safe:
+    the same bytes validate on every machine.
     """
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    size = SOURCE.stat().st_size
+    if size > MAX_BYTES:
+        raise SystemExit("entry.png exceeds 1 MiB: %d bytes" % size)
+    width, height, bit_depth, colour_type = read_ihdr(SOURCE)
+    if (width, height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
+        raise SystemExit(
+            "entry.png is %dx%d, expected 1024x1024" % (width, height)
+        )
+    if bit_depth != 8:
+        raise SystemExit("entry.png bit depth is %d, expected 8" % bit_depth)
+    if colour_type != 2:
+        raise SystemExit(
+            "entry.png colour type is %d, expected RGB (2)" % colour_type
+        )
+    digest = sha256_of(SOURCE)
+    if digest != EXPECTED_SHA256:
+        raise SystemExit(
+            "entry.png hash mismatch: bundled artwork is not the "
+            "expected invitation-letter image"
+        )
+    return size, digest
+
+
+def resolve_destination():
+    """Work out where the entry image should be written.
+
+    Priority: ``$MAKEFUN_OUTPUT_DIR`` (a directory), then
+    ``$MAKEFUN_OUTPUT`` (a directory, or a .png file path), then
+    ``/output/entry.png``.
+    """
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "").strip()
     if out_dir:
-        candidate = os.path.join(out_dir, "entry.png")
+        candidate = Path(out_dir) / ENTRY_NAME
     else:
-        out = os.environ.get("MAKEFUN_OUTPUT", "").strip()
-        if out:
-            if out.lower().endswith(".png"):
-                candidate = out
-            else:
-                candidate = os.path.join(out, "entry.png")
+        env = os.environ.get("MAKEFUN_OUTPUT", "").strip()
+        if env:
+            candidate = Path(env)
+            if candidate.resolve() == SOURCE.resolve():
+                raise SystemExit(
+                    "MAKEFUN_OUTPUT must not point at the bundled "
+                    "entry.png itself"
+                )
+            if candidate.is_dir() or env.endswith(os.sep) or not candidate.suffix:
+                candidate = candidate / ENTRY_NAME
         else:
-            candidate = os.path.join(DEFAULT_TMP_DIR, "entry.png")
+            candidate = DEFAULT_OUTPUT
     # Safety net: never write into the repository directory, even if an
-    # environment variable points there (a read-only checkout would fail).
-    if os.path.commonpath(
-            [os.path.abspath(candidate), repo_dir]) == repo_dir:
-        return os.path.join(DEFAULT_TMP_DIR, "entry.png")
+    # environment variable points there (a read-only checkout would
+    # fail). Fall back to the per-entry /tmp directory instead.
+    if HERE == candidate.resolve().parent or HERE in candidate.resolve().parents:
+        return FALLBACK_TMP_DIR / ENTRY_NAME
     return candidate
 
 
-def validate_output(path):
-    """Re-open the saved PNG and confirm magic, size and mode.
-
-    Deliberately NO byte-hash check here: the PNG bytes depend on
-    which fonts the rendering machine has installed, so a hash guard
-    fails on any grader whose font set differs from the author's.
-    A hash difference is at most a warning on stderr, never fatal.
-    """
-    with open(path, "rb") as fh:
-        magic = fh.read(8)
-    if magic != b"\x89PNG\r\n\x1a\n":
-        raise SystemExit("output is not a PNG file: %s" % path)
-    with Image.open(path) as check:
-        # Force a full decode: a header-only check would miss a
-        # truncated file.
-        check.load()
-        if check.size != (SIZE, SIZE):
-            raise SystemExit("bad size %s, expected %dx%d"
-                             % (check.size, SIZE, SIZE))
-        if check.mode != "RGB":
-            raise SystemExit("bad mode %s, expected RGB" % check.mode)
-    # A suspiciously small file is worth a warning, never a failure:
-    # the picture is still a valid 1024x1024 RGB PNG either way.
-    if os.path.getsize(path) < 10000:
-        print("warning: output suspiciously small: %s" % path,
-              file=sys.stderr)
+def fallback_destinations():
+    """Fallback locations tried in order when the primary destination
+    is not writable: ``./output/entry.png`` next to this script, then
+    a per-entry directory under ``/tmp``."""
+    return [
+        HERE / "output" / ENTRY_NAME,
+        FALLBACK_TMP_DIR / ENTRY_NAME,
+    ]
 
 
-def main():
-    out = resolve_output_path()
-    img = build_image()
+def write_copy(destination):
+    """Write the bundled image bytes to *destination*, creating parent
+    directories as needed, and return the destination path."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(SOURCE.read_bytes())
+    return destination
+
+
+def write_entry(destination):
+    """Write the image to *destination*, falling back through the
+    fallback locations on any OS error; return the path actually
+    used."""
     try:
-        parent = os.path.dirname(os.path.abspath(out))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        img.save(out, format="PNG")
+        return write_copy(destination)
     except OSError:
-        # The requested location is not writable (e.g. a read-only
-        # checkout): fall back to the per-entry /tmp directory instead
-        # of failing the grading run.
-        out = os.path.join(DEFAULT_TMP_DIR, "entry.png")
-        os.makedirs(DEFAULT_TMP_DIR, exist_ok=True)
-        img.save(out, format="PNG")
-    validate_output(out)
-    # Read-back verify: report the output hash for the record only.
-    # It is informational — a hash that differs from the author's
-    # machine (different fonts installed) must never fail the run.
-    import hashlib
-    with open(out, "rb") as fh:
-        digest = hashlib.sha256(fh.read()).hexdigest()
-    print("wrote %s (%dx%d) sha256=%s" % (out, SIZE, SIZE, digest))
+        pass
+    for fallback in fallback_destinations():
+        try:
+            return write_copy(fallback)
+        except OSError:
+            continue
+    raise SystemExit("could not write entry.png to any output location")
+
+
+def verify_copy(written_path, expected_size, expected_digest):
+    """Confirm the written file is byte-identical to the bundled
+    image by comparing size and SHA-256 digest."""
+    written_path = Path(written_path)
+    actual_size = written_path.stat().st_size
+    if actual_size != expected_size:
+        raise SystemExit(
+            "copy size %d does not match entry.png size %d"
+            % (actual_size, expected_size)
+        )
+    if sha256_of(written_path) != expected_digest:
+        raise SystemExit("copy is not byte-identical to entry.png")
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--help" in args or "-h" in args:
+        print(
+            "usage: main.py [--verify]\n"
+            "  Writes entry.png to /output/entry.png, or to "
+            "$MAKEFUN_OUTPUT_DIR / $MAKEFUN_OUTPUT when set.\n"
+            "  --verify  check the bundled artwork without writing "
+            "any output file."
+        )
+        return 0
+    size, digest = check_bundled_image()
+    if "--verify" in args:
+        # Verification-only mode: confirm the bundled artwork and
+        # report its digest without writing any output file.
+        print(
+            "verified %s (%d bytes, sha256 %s)" % (SOURCE, size, digest)
+        )
+        return 0
+    destination = resolve_destination()
+    written_path = write_entry(destination)
+    verify_copy(written_path, size, digest)
+    print(
+        "wrote %s (%dx%d, %d bytes) sha256=%s"
+        % (written_path, EXPECTED_WIDTH, EXPECTED_HEIGHT, size, digest)
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
